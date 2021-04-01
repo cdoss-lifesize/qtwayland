@@ -1,0 +1,213 @@
+diff --git a/examples/wayland/custom-extension/client-common/customextension.cpp b/examples/wayland/custom-extension/client-common/customextension.cpp
+index aa0cb58a..2a089c0e 100644
+--- a/examples/wayland/custom-extension/client-common/customextension.cpp
++++ b/examples/wayland/custom-extension/client-common/customextension.cpp
+@@ -81,8 +81,12 @@ QWindow *CustomExtension::windowForSurface(struct ::wl_surface *surface)
+ 
+ bool CustomExtension::eventFilter(QObject *object, QEvent *event)
+ {
+-    if (event->type() == QEvent::PlatformSurface
+-            && static_cast<QPlatformSurfaceEvent*>(event)->surfaceEventType() == QPlatformSurfaceEvent::SurfaceCreated) {
++    if (event->type() == QEvent::Expose) {
++        auto ee = static_cast<QExposeEvent*>(event);
++
++        if ((ee->region().isNull())) {
++            return false;
++        }
+         QWindow *window = qobject_cast<QWindow*>(object);
+         Q_ASSERT(window);
+         window->removeEventFilter(this);
+diff --git a/src/client/qwaylandwindow.cpp b/src/client/qwaylandwindow.cpp
+index f61c141c..1a564709 100644
+--- a/src/client/qwaylandwindow.cpp
++++ b/src/client/qwaylandwindow.cpp
+@@ -72,6 +72,8 @@ Q_LOGGING_CATEGORY(lcWaylandBackingstore, "qt.qpa.wayland.backingstore")
+ 
+ QWaylandWindow *QWaylandWindow::mMouseGrab = nullptr;
+ 
++QReadWriteLock mSurfaceLock;
++
+ QWaylandWindow::QWaylandWindow(QWindow *window)
+     : QPlatformWindow(window)
+     , mDisplay(waylandScreen()->display())
+@@ -91,7 +93,7 @@ QWaylandWindow::~QWaylandWindow()
+     delete mWindowDecoration;
+ 
+     if (isInitialized())
+-        reset(false);
++        reset();
+ 
+     const QWindow *parent = window();
+     foreach (QWindow *w, QGuiApplication::topLevelWindows()) {
+@@ -117,8 +119,6 @@ void QWaylandWindow::initWindow()
+ 
+     if (!isInitialized()) {
+         initializeWlSurface();
+-        QPlatformSurfaceEvent e(QPlatformSurfaceEvent::SurfaceCreated);
+-        QGuiApplication::sendEvent(window(), &e);
+     }
+ 
+     if (shouldCreateSubSurface()) {
+@@ -199,6 +199,7 @@ void QWaylandWindow::initWindow()
+ 
+ void QWaylandWindow::initializeWlSurface()
+ {
++    QWriteLocker lock(&mSurfaceLock);
+     init(mDisplay->createSurface(static_cast<QtWayland::wl_surface *>(this)));
+ }
+ 
+@@ -224,18 +225,15 @@ bool QWaylandWindow::shouldCreateSubSurface() const
+     return QPlatformWindow::parent() != nullptr;
+ }
+ 
+-void QWaylandWindow::reset(bool sendDestroyEvent)
++void QWaylandWindow::reset()
+ {
+-    if (isInitialized() && sendDestroyEvent) {
+-        QPlatformSurfaceEvent e(QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed);
+-        QGuiApplication::sendEvent(window(), &e);
+-    }
+     delete mShellSurface;
+     mShellSurface = nullptr;
+     delete mSubSurfaceWindow;
+     mSubSurfaceWindow = nullptr;
+     if (isInitialized()) {
+         emit wlSurfaceDestroyed();
++        QWriteLocker lock(&mSurfaceLock);
+         destroy();
+     }
+     mScreens.clear();
+@@ -1094,24 +1092,6 @@ QVariant QWaylandWindow::property(const QString &name, const QVariant &defaultVa
+ 
+ void QWaylandWindow::timerEvent(QTimerEvent *event)
+ {
+-    if (event->timerId() == mFallbackUpdateTimerId) {
+-        killTimer(mFallbackUpdateTimerId);
+-        mFallbackUpdateTimerId = -1;
+-        qCDebug(lcWaylandBackingstore) << "mFallbackUpdateTimer timed out";
+-
+-        if (!isExposed()) {
+-            qCDebug(lcWaylandBackingstore) << "Fallback update timer: Window not exposed,"
+-                                           << "not delivering update request.";
+-            return;
+-        }
+-
+-        if (mWaitingForUpdate && hasPendingUpdateRequest() && !mWaitingForFrameCallback) {
+-            qCWarning(lcWaylandBackingstore) << "Delivering update request through fallback timer,"
+-                                             << "may not be in sync with display";
+-            deliverUpdateRequest();
+-        }
+-    }
+-
+ 
+     if (mFrameCallbackTimerId.testAndSetOrdered(event->timerId(), -1)) {
+         killTimer(event->timerId());
+@@ -1124,6 +1104,7 @@ void QWaylandWindow::timerEvent(QTimerEvent *event)
+ 
+ void QWaylandWindow::requestUpdate()
+ {
++    qCDebug(lcWaylandBackingstore) << "requestUpdate";
+     Q_ASSERT(hasPendingUpdateRequest()); // should be set by QPA
+ 
+     // If we have a frame callback all is good and will be taken care of there
+@@ -1131,20 +1112,17 @@ void QWaylandWindow::requestUpdate()
+         return;
+ 
+     // If we've already called deliverUpdateRequest(), but haven't seen any attach+commit/swap yet
+-    if (mWaitingForUpdate) {
+-        // Ideally, we should just have returned here, but we're not guaranteed that the client
+-        // will actually update, so start this timer to deliver another request update after a while
+-        // *IF* the client doesn't update.
+-        int fallbackTimeout = 100;
+-        mFallbackUpdateTimerId = startTimer(fallbackTimeout);
+-        return;
+-    }
++    // This is a somewhat redundant behavior and might indicate a bug in the calling code, so log
++    // here so we can get this information when debugging update/frame callback issues.
++    // Continue as nothing happened, though.
++    if (mWaitingForUpdate)
++        qCDebug(lcWaylandBackingstore) << "requestUpdate called twice without committing anything";
+ 
+     // Some applications (such as Qt Quick) depend on updates being delivered asynchronously,
+     // so use invokeMethod to delay the delivery a bit.
+     QMetaObject::invokeMethod(this, [this] {
+         // Things might have changed in the meantime
+-        if (hasPendingUpdateRequest() && !mWaitingForUpdate && !mWaitingForFrameCallback)
++        if (hasPendingUpdateRequest() && !mWaitingForFrameCallback)
+             deliverUpdateRequest();
+     }, Qt::QueuedConnection);
+ }
+@@ -1154,22 +1132,18 @@ void QWaylandWindow::requestUpdate()
+ // Can be called from the render thread (without locking anything) so make sure to not make races in this method.
+ void QWaylandWindow::handleUpdate()
+ {
++    qCDebug(lcWaylandBackingstore) << "handleUpdate" << QThread::currentThread();
+     // TODO: Should sync subsurfaces avoid requesting frame callbacks?
++    QReadLocker lock(&mSurfaceLock);
++    if (!isInitialized()) {
++        return;
++    }
+ 
+     if (mFrameCallback) {
+         wl_callback_destroy(mFrameCallback);
+         mFrameCallback = nullptr;
+     }
+ 
+-    if (mFallbackUpdateTimerId != -1) {
+-        // Ideally, we would stop the fallback timer here, but since we're on another thread,
+-        // it's not allowed. Instead we set mFallbackUpdateTimer to -1 here, so we'll just
+-        // ignore it if it times out before it's cleaned up by the invokeMethod call.
+-        int id = mFallbackUpdateTimerId;
+-        mFallbackUpdateTimerId = -1;
+-        QMetaObject::invokeMethod(this, [this, id] { killTimer(id); }, Qt::QueuedConnection);
+-    }
+-
+     mFrameCallback = frame();
+     wl_callback_add_listener(mFrameCallback, &QWaylandWindow::callbackListener, this);
+     mWaitingForFrameCallback = true;
+@@ -1189,6 +1163,7 @@ void QWaylandWindow::handleUpdate()
+ 
+ void QWaylandWindow::deliverUpdateRequest()
+ {
++    qCDebug(lcWaylandBackingstore) << "deliverUpdateRequest";
+     mWaitingForUpdate = true;
+     QPlatformWindow::deliverUpdateRequest();
+ }
+diff --git a/src/client/qwaylandwindow_p.h b/src/client/qwaylandwindow_p.h
+index 86139243..4d1cd1cd 100644
+--- a/src/client/qwaylandwindow_p.h
++++ b/src/client/qwaylandwindow_p.h
+@@ -53,6 +53,7 @@
+ 
+ #include <QtCore/QWaitCondition>
+ #include <QtCore/QMutex>
++#include <QtCore/QReadWriteLock>
+ #include <QtGui/QIcon>
+ #include <QtCore/QVariant>
+ #include <QtCore/QLoggingCategory>
+@@ -229,7 +230,6 @@ protected:
+ 
+     // True when we have called deliverRequestUpdate, but the client has not yet attached a new buffer
+     bool mWaitingForUpdate = false;
+-    int mFallbackUpdateTimerId = -1; // Started when waiting for app to commit
+ 
+     QMutex mResizeLock;
+     bool mWaitingToApplyConfigure = false;
+@@ -261,7 +261,7 @@ private:
+     void initializeWlSurface();
+     bool shouldCreateShellSurface() const;
+     bool shouldCreateSubSurface() const;
+-    void reset(bool sendDestroyEvent = true);
++    void reset();
+     void sendExposeEvent(const QRect &rect);
+     static void closePopups(QWaylandWindow *parent);
+     QWaylandScreen *calculateScreenFromSurfaceEvents() const;
+@@ -277,6 +277,8 @@ private:
+     static QMutex mFrameSyncMutex;
+     static QWaylandWindow *mMouseGrab;
+ 
++    QReadWriteLock mSurfaceLock;
++    
+     friend class QWaylandSubSurface;
+ };
+ 
